@@ -1,0 +1,142 @@
+#!/bin/bash
+
+build_root=/tmp/build
+cache_root=/tmp/cache
+env_root=/tmp/environment.d
+buildpack_root=/usr/buildpacks
+
+if [[ "$1" == "-" ]]; then
+    slug_file="$1"
+else
+    slug_file=/tmp/slug.tar.gz
+fi
+
+function output_redirect() {
+    if [[ "$slug_file" == "-" ]]; then
+        cat - 1>&2
+    else
+        cat -
+    fi
+}
+
+function echo_title() {
+    echo $'\e[1G----->' "$*" | output_redirect
+}
+
+function echo_normal() {
+    echo $'\e[1G      ' "$*" | output_redirect
+}
+
+function ensure_indent() {
+    while read -r line; do
+        if [[ "$line" == --* ]]; then
+            echo $'\e[1G'"$line" | output_redirect
+        else
+            echo $'\e[1G      ' "$line" | output_redirect
+        fi
+    done
+}
+
+mkdir -p $build_root
+mkdir -p $cache_root
+mkdir -p $env_root
+mkdir -p $buildpack_root
+
+# extract archive passed via `git archive | build`
+tar -xf - -C $build_root
+
+# Buildpack detection
+buildpacks=(${buildpack_root}/*)
+selected_buildpack=
+if [[ -n "$BUILDPACK_URL" ]]; then
+    echo_title "Fetching custom buildpack"
+
+    buildpack="$buildpack_root/custom"
+    rm -fr "$buildpack"
+
+    url=${BUILDPACK_URL%#*}
+    committish=${BUILDPACK_URL#*#}
+
+    if [ "$committish" == "$url" ]; then
+        committish="master"
+    fi
+
+    set +e
+    git clone --branch "$committish" --depth=1 "$url" "$buildpack" &> /dev/null
+    SHALLOW_CLONED=$?
+    set -e
+    if [ $SHALLOW_CLONED -ne 0 ]; then
+        # if the shallow clone failed partway through, clean up and try a full clone
+        rm -rf "$buildpack"
+        git clone --quiet "$url" "$buildpack"
+        pushd "$buildpack" &>/dev/null
+            git checkout --quiet "$committish"
+            git submodule init --quiet
+            git submodule update --quiet --recursive
+        popd &>/dev/null
+    fi
+
+    selected_buildpack="$buildpack"
+    buildpack_name=$("$buildpack/bin/detect" "$build_root") && selected_buildpack=$buildpack
+else
+    for buildpack in "${buildpacks[@]}"; do
+        shopt -s nocasematch
+        if [[ "$DEIS_BUILDPACK_DEBUG" == "True" ]]; then
+            buildpack_name=$("$buildpack/bin/detect" "$build_root") && selected_buildpack=$buildpack && break
+        else
+            buildpack_name=$("$buildpack/bin/detect" "$build_root" 2> /dev/null) && selected_buildpack=$buildpack && break
+        fi
+    done
+fi
+
+if [[ -n "$selected_buildpack" ]]; then
+    echo_title "$buildpack_name app detected"
+else
+    echo_title "Unable to select a buildpack"
+    exit 1
+fi
+
+# Run pre-compile hook
+if [[ -f "$build_root/bin/pre-compile" ]]; then
+    pushd "$build_root" &> /dev/null
+    "$build_root/bin/pre-compile"
+    popd &>/dev/null
+fi
+
+# Buildpack compile
+"$selected_buildpack/bin/compile" "$build_root" "$cache_root" "$env_root" | ensure_indent
+
+# bin/release is optional
+if [[ -f "$selected_buildpack/bin/release" ]]; then
+    "$selected_buildpack/bin/release" "$build_root" > $build_root/.release
+fi
+
+# Run post-compile hook
+if [[ -f "$build_root/bin/post-compile" ]]; then
+    pushd "$build_root" &> /dev/null
+    "$build_root/bin/post-compile"
+    popd &>/dev/null
+fi
+
+echo_title "Discovering process types"
+if [[ -f "$build_root/Procfile" ]]; then
+    types=$(read_procfile_keys "$build_root/Procfile")
+    echo_normal "Procfile declares types -> $types"
+fi
+default_types=""
+if [[ -s "$build_root/.release" ]]; then
+    default_types=$(ruby -e "require 'yaml';puts ((YAML.load_file('$build_root/.release') || {})['default_process_types'] || {}).keys().join(', ')")
+    [[ $default_types ]] && echo_normal "Default process types for $buildpack_name -> $default_types"
+fi
+
+# Produce slug
+if [[ -f "$build_root/.slugignore" ]]; then
+    tar -z --exclude='.git' -X "$build_root/.slugignore" -C $build_root -cf $slug_file . | cat
+else
+    tar -z --exclude='.git' -C $build_root -cf $slug_file . | cat
+fi
+
+if [[ "$slug_file" != "-" ]]; then
+    slug_size=$(du -Sh "$slug_file" | cut -f1)
+    echo_title "Compiled slug size is $slug_size"
+fi
